@@ -301,6 +301,209 @@ def plot_motion_qc(fd_per_run: List[np.ndarray],
     return fig
 
 
+# ── LPS→RAS affine correction constant (ANTsPy uses LPS; nibabel uses RAS) ───
+_LPS_TO_RAS = np.diag([-1., -1., 1., 1.])
+
+
+def ants_to_nibabel(ants_img, dtype=np.float32) -> nib.Nifti1Image:
+    """Convert an ANTsPy image to a nibabel NIfTI, correcting LPS→RAS coordinates.
+
+    ANTsPy stores images in **LPS** (Left-Posterior-Superior) convention
+    internally, whereas nibabel assumes **RAS** (Right-Anterior-Superior).
+    This function corrects the affine matrix by flipping the x and y axes
+    with the diagonal sign matrix ``diag([-1, -1, 1, 1])``.
+
+    Parameters
+    ----------
+    ants_img : ants.ANTsImage
+        ANTsPy image returned by ``ants.apply_transforms()`` or similar.
+    dtype : numpy dtype, optional
+        Data type for the output array (default float32).
+
+    Returns
+    -------
+    nib_img : nib.Nifti1Image
+        NIfTI image in RAS coordinates, compatible with nibabel / nilearn.
+
+    Example
+    -------
+    >>> warped_ants = ants.apply_transforms(fixed=ref, moving=mni_mask,
+    ...                                     transformlist=[xfm1, xfm2],
+    ...                                     interpolator='genericLabel')
+    >>> warped_nib = ants_to_nibabel(warped_ants, dtype=np.uint8)
+    >>> print(warped_nib.shape)  # same spatial shape as ref
+    """
+    data = ants_img.numpy().astype(dtype)
+    # Build LPS affine from ANTsPy metadata
+    direction = np.array(ants_img.direction).reshape(3, 3)
+    spacing   = np.array(ants_img.spacing)
+    origin    = np.array(ants_img.origin)
+
+    affine_lps          = np.eye(4)
+    affine_lps[:3, :3]  = direction * spacing[np.newaxis, :]
+    affine_lps[:3, 3]   = origin
+
+    affine_ras = _LPS_TO_RAS @ affine_lps
+    return nib.Nifti1Image(data, affine_ras)
+
+
+def warp_group_mask_to_func(
+    group_mask_mni,
+    func_ref_img,
+    mni_to_t1w_xfm: str,
+    t1w_to_func_xfm: str,
+    ants_available: bool = True,
+) -> nib.Nifti1Image:
+    """Warp a group-level MNI mask to functional (scanner) space.
+
+    Applies the two-step fMRIPrep transform chain in right-to-left order:
+
+    ``MNI mask → [MNI→T1w .h5] → [T1w→func .txt] → functional space``
+
+    Uses ANTsPy with the ``genericLabel`` interpolator when available, or
+    falls back to ``nilearn.image.resample_to_img`` (nearest-neighbour) if
+    ANTsPy is not installed.
+
+    Parameters
+    ----------
+    group_mask_mni : str or nib.Nifti1Image
+        Binary mask in MNI152NLin6Asym space (any resolution).
+    func_ref_img : str or nib.Nifti1Image
+        Functional reference image that defines the target voxel grid
+        (e.g., fMRIPrep ``_boldref.nii.gz``).
+    mni_to_t1w_xfm : str
+        Path to the composite MNI→T1w warp file (.h5) from fMRIPrep.
+    t1w_to_func_xfm : str
+        Path to the T1w→functional affine file (.txt, BBR) from fMRIPrep.
+    ants_available : bool, optional
+        If True (default), use ANTsPy. If False, fall back to nilearn.
+
+    Returns
+    -------
+    warped_mask : nib.Nifti1Image
+        Binary mask in functional space, resampled to the grid of
+        ``func_ref_img``.
+
+    Notes
+    -----
+    The transform list passed to ANTsPy is ``[t1w_to_func_xfm, mni_to_t1w_xfm]``
+    (innermost first, applied right-to-left). This matches fMRIPrep's convention.
+
+    Example
+    -------
+    >>> warped = warp_group_mask_to_func(
+    ...     group_mask_mni  = "/path/to/group_mask_MNI.nii.gz",
+    ...     func_ref_img    = nib.load("sub-1_run-01_boldref.nii.gz"),
+    ...     mni_to_t1w_xfm  = "sub-1_from-MNI152_to-T1w_mode-image_xfm.h5",
+    ...     t1w_to_func_xfm = "sub-1_run-01_from-T1w_to-scanner_mode-image_xfm.txt",
+    ... )
+    >>> print(warped.get_fdata().sum())  # number of mask voxels in func space
+    """
+    # Ensure nibabel images are on disk for ANTsPy (it needs paths)
+    if not isinstance(group_mask_mni, str):
+        import tempfile, os as _os
+        _tmp = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False)
+        group_mask_mni.to_filename(_tmp.name)
+        group_mask_mni = _tmp.name
+
+    func_ref_img = image.load_img(func_ref_img)
+
+    if ants_available:
+        try:
+            import ants  # type: ignore
+            ants_ref    = ants.image_read(func_ref_img.get_filename()
+                                          if hasattr(func_ref_img, 'get_filename')
+                                          else _nibabel_to_ants_tmpfile(func_ref_img))
+            ants_moving = ants.image_read(group_mask_mni)
+
+            warped_ants = ants.apply_transforms(
+                fixed        = ants_ref,
+                moving       = ants_moving,
+                transformlist= [t1w_to_func_xfm, mni_to_t1w_xfm],
+                interpolator = 'genericLabel',
+            )
+            warped_nib = ants_to_nibabel(warped_ants, dtype=np.uint8)
+            # Binarise (genericLabel can return small fractions near borders)
+            warped_data = (warped_nib.get_fdata() > 0.5).astype(np.uint8)
+            return nib.Nifti1Image(warped_data, warped_nib.affine, warped_nib.header)
+        except Exception as e:
+            warnings.warn(f"ANTsPy warp failed ({e}); falling back to nilearn resampling.")
+
+    # ── nilearn fallback ─────────────────────────────────────────────────────
+    mask_img = image.load_img(group_mask_mni)
+    resampled = image.resample_to_img(mask_img, func_ref_img,
+                                      interpolation='nearest')
+    data = (resampled.get_fdata() > 0.5).astype(np.uint8)
+    return nib.Nifti1Image(data, resampled.affine, resampled.header)
+
+
+def _nibabel_to_ants_tmpfile(nib_img: nib.Nifti1Image) -> str:
+    """Save a nibabel image to a temporary file and return the path."""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False)
+    nib_img.to_filename(tmp.name)
+    return tmp.name
+
+
+def filter_mask_by_variance(
+    warped_mask_img: nib.Nifti1Image,
+    bold_img: nib.Nifti1Image,
+    var_threshold: float = 1e-6,
+) -> Tuple[nib.Nifti1Image, int]:
+    """Remove voxels with near-zero temporal variance from a functional mask.
+
+    Voxels that never change over time (e.g., outside the brain, corrupted
+    by signal dropout) carry no information and can cause numerical instability
+    in sklearn estimators. This function removes any mask voxel whose temporal
+    variance in the BOLD signal falls below ``var_threshold``.
+
+    Parameters
+    ----------
+    warped_mask_img : nib.Nifti1Image
+        Binary mask in functional space (output of
+        :func:`warp_group_mask_to_func`).
+    bold_img : nib.Nifti1Image
+        4-D BOLD image in the same space.  Must share the same voxel grid
+        as ``warped_mask_img`` (resample first if needed).
+    var_threshold : float, optional
+        Variance threshold below which a voxel is excluded (default 1e-6).
+
+    Returns
+    -------
+    filtered_mask : nib.Nifti1Image
+        Binary mask with zero-variance voxels removed.
+    n_removed : int
+        Number of voxels removed from the mask.
+
+    Example
+    -------
+    >>> filtered, n = filter_mask_by_variance(warped_mask, bold_img)
+    >>> print(f"Removed {n} zero-variance voxels from mask")
+    """
+    bold_img_res = image.resample_to_img(bold_img, warped_mask_img,
+                                          interpolation='continuous')
+    mask_data = warped_mask_img.get_fdata().astype(bool)
+    bold_data = bold_img_res.get_fdata()
+
+    # Extract time series for masked voxels (shape: n_voxels × n_timepoints)
+    masked_ts = bold_data[mask_data]             # (n_vox, T)
+    voxel_var = masked_ts.var(axis=-1)           # (n_vox,)
+
+    keep    = voxel_var >= var_threshold
+    n_removed = int((~keep).sum())
+
+    # Rebuild 3-D mask keeping only high-variance voxels
+    new_mask_data    = np.zeros_like(mask_data, dtype=np.uint8)
+    mask_indices     = np.where(mask_data)
+    kept_coords      = tuple(ax[keep] for ax in mask_indices)
+    new_mask_data[kept_coords] = 1
+
+    filtered_mask = nib.Nifti1Image(new_mask_data,
+                                    warped_mask_img.affine,
+                                    warped_mask_img.header)
+    return filtered_mask, n_removed
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 2 — BETA ESTIMATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1038,3 +1241,329 @@ def print_section(title: str, width: int = 55) -> None:
     print("=" * width)
     print(f"  {title}")
     print("=" * width)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 5 — TUTORIAL HELPERS  (beta → MVPA combined pipeline)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def stack_betas_from_dict(betas_dict: dict,
+                          mask_img: nib.Nifti1Image,
+                          conditions: Optional[List[str]] = None
+                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, NiftiMasker]:
+    """Stack a betas dict (from fit_lsa_run / fit_lss_run) into a feature matrix.
+
+    Converts the per-trial beta dict produced by ``fit_lsa_run`` or
+    ``fit_lss_run`` into the (n_trials × n_voxels) matrix required by
+    the MVPA classifier, along with condition labels and run indices.
+
+    Parameters
+    ----------
+    betas_dict : dict
+        Keys: (run_id, trial_idx).
+        Values: dict with keys 'img' (Nifti1Image), 'condition' (str), 'run' (int).
+        Produced by ``fit_lsa_run`` / ``fit_lss_run``.
+    mask_img : nib.Nifti1Image
+        Brain mask. Used to fit a NiftiMasker that applies to every beta image.
+    conditions : list of str or None
+        Subset of conditions to keep.  None → all conditions.
+
+    Returns
+    -------
+    X : np.ndarray
+        Feature matrix, shape (n_trials, n_voxels), dtype float32.
+    y_raw : np.ndarray
+        String condition labels, shape (n_trials,).
+    runs_arr : np.ndarray
+        Run index per trial, shape (n_trials,), dtype int.
+    masker : NiftiMasker
+        Fitted masker — call masker.inverse_transform(vec) to rebuild NIfTIs.
+
+    Example
+    -------
+    >>> X, y_raw, runs_arr, masker = stack_betas_from_dict(all_betas, mask_img)
+    >>> print(f"Feature matrix: {X.shape}")   # (n_trials, n_voxels)
+    """
+    # Sort keys for reproducible ordering
+    sorted_keys = sorted(betas_dict.keys())
+
+    # Optional condition filter
+    if conditions is not None:
+        sorted_keys = [k for k in sorted_keys
+                       if betas_dict[k]['condition'] in conditions]
+
+    if not sorted_keys:
+        raise ValueError("No trials remain after condition filtering.")
+
+    # Fit masker on first image to set up resampler
+    first_img = betas_dict[sorted_keys[0]]['img']
+    masker = NiftiMasker(mask_img=mask_img, standardize=False, detrend=False)
+    masker.fit(first_img)
+
+    rows, labels, runs = [], [], []
+    for key in sorted_keys:
+        info = betas_dict[key]
+        vec = masker.transform(info['img']).ravel()
+        rows.append(vec)
+        labels.append(info['condition'])
+        runs.append(int(info['run']))
+
+    X = np.vstack(rows).astype(np.float32)
+    print(f"  Feature matrix: {X.shape[0]} trials × {X.shape[1]} voxels")
+    return X, np.array(labels), np.array(runs, dtype=int), masker
+
+
+def run_permutation_test(X: np.ndarray,
+                         y: np.ndarray,
+                         runs_arr: np.ndarray,
+                         pipe,
+                         observed_acc: float,
+                         n_permutations: int = 1000,
+                         method: str = 'label_shuffle',
+                         seed: int = 42
+                         ) -> Tuple[np.ndarray, float]:
+    """Non-parametric permutation test for MVPA classification accuracy.
+
+    Builds a null distribution by either shuffling class labels or applying
+    sign flips (for zero-centred weight maps), then computes a one-sided
+    p-value: ``p = #{null_acc >= observed_acc} / n_permutations``.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix (n_trials, n_voxels).
+    y : np.ndarray
+        Integer class labels (n_trials,).
+    runs_arr : np.ndarray
+        Run index per trial — used as ``groups`` for LeaveOneGroupOut.
+    pipe : sklearn Pipeline
+        Fitted (or unfitted) pipeline with steps 'feature_selection' and 'svm'.
+        Re-used structure only; a fresh clone is fitted per permutation.
+    observed_acc : float
+        The true mean CV accuracy to compare against.
+    n_permutations : int
+        Number of shuffles (default 1000; use ≥ 5000 for publication).
+    method : str
+        ``'label_shuffle'`` (default): randomly permute y across all trials.
+        ``'sign_flip'``    : multiply each trial's row in X by ±1 (for mean-centred
+                             importance maps; not suitable for raw BOLD).
+    seed : int
+        Random seed (default 42).
+
+    Returns
+    -------
+    null_accs : np.ndarray
+        Shape (n_permutations,). Accuracy under each permutation.
+    p_value : float
+        One-sided p-value.  Floored at ``1 / n_permutations``.
+
+    Example
+    -------
+    >>> null_accs, p_val = run_permutation_test(
+    ...     X, y, runs_arr, pipe, observed_acc=mean_acc, n_permutations=1000)
+    >>> print(f"p = {p_val:.4f}")
+    """
+    from sklearn.base import clone
+    from sklearn.model_selection import LeaveOneGroupOut, cross_val_predict
+    from sklearn.metrics import accuracy_score
+
+    rng  = np.random.default_rng(seed)
+    cv   = LeaveOneGroupOut()
+    null_accs = np.empty(n_permutations)
+
+    for i in range(n_permutations):
+        if method == 'sign_flip':
+            signs  = rng.choice([-1.0, 1.0], size=(X.shape[0], 1))
+            X_perm = X * signs
+            y_perm = y
+        else:  # label_shuffle
+            X_perm = X
+            y_perm = rng.permutation(y)
+
+        y_null = cross_val_predict(
+            clone(pipe), X_perm, y_perm,
+            cv=cv, groups=runs_arr, n_jobs=-1
+        )
+        null_accs[i] = accuracy_score(y_perm, y_null)
+
+        if (i + 1) % 200 == 0:
+            print(f"  Permutation {i+1}/{n_permutations} — "
+                  f"null mean so far: {null_accs[:i+1].mean()*100:.2f}%")
+
+    p_value = float(np.maximum((null_accs >= observed_acc).mean(),
+                               1.0 / n_permutations))
+    print(f"\nPermutation test complete.")
+    print(f"  Observed accuracy : {observed_acc*100:.2f}%")
+    print(f"  Null distribution : {null_accs.mean()*100:.2f}% ± "
+          f"{null_accs.std()*100:.2f}% SD")
+    print(f"  p-value           : {p_value:.4f}  "
+          f"({'significant ✓' if p_value < 0.05 else 'not significant ✗'} at α = 0.05)")
+    return null_accs, p_value
+
+
+def make_block_events(events_df: pd.DataFrame,
+                      block_gap_s: float = 2.0
+                      ) -> pd.DataFrame:
+    """Merge consecutive same-condition trials into block-level events.
+
+    Trials are grouped into blocks when consecutive trials of the same
+    ``trial_type`` are separated by less than ``block_gap_s`` seconds
+    (approximated as onset_next − onset_current − duration_current < block_gap_s).
+    The resulting DataFrame has one row per block, with onset = first trial onset,
+    duration = last trial offset − first trial onset, and the shared trial_type.
+
+    This is useful for visualising block structure or fitting a block-level
+    (rather than trial-level) GLM as a sanity check.
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        Must have columns: onset, duration, trial_type.  Should be sorted by onset.
+    block_gap_s : float
+        Maximum gap (s) between consecutive trials of the same condition
+        for them to be merged into one block (default 2.0 s).
+
+    Returns
+    -------
+    blocks_df : pd.DataFrame
+        Columns: onset, duration, trial_type, n_trials.
+
+    Example
+    -------
+    >>> blocks = make_block_events(events_df, block_gap_s=2.0)
+    >>> print(blocks[['onset', 'duration', 'trial_type', 'n_trials']])
+    """
+    df = events_df.sort_values('onset').reset_index(drop=True)
+    blocks, current = [], None
+
+    for _, row in df.iterrows():
+        if current is None:
+            current = {'onset':      row['onset'],
+                       'end':        row['onset'] + row['duration'],
+                       'trial_type': row['trial_type'],
+                       'n_trials':   1}
+        else:
+            gap = row['onset'] - current['end']
+            if row['trial_type'] == current['trial_type'] and gap <= block_gap_s:
+                current['end']      = row['onset'] + row['duration']
+                current['n_trials'] += 1
+            else:
+                blocks.append(current)
+                current = {'onset':      row['onset'],
+                           'end':        row['onset'] + row['duration'],
+                           'trial_type': row['trial_type'],
+                           'n_trials':   1}
+
+    if current is not None:
+        blocks.append(current)
+
+    out = pd.DataFrame(blocks)
+    out['duration'] = out['end'] - out['onset']
+    return out[['onset', 'duration', 'trial_type', 'n_trials']].reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELP / DISCOVERY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def list_helpers(verbose: bool = False) -> None:
+    """Print a formatted catalogue of all public helper functions in this module.
+
+    For each function, shows its one-line summary (first line of docstring),
+    call signature, and — when ``verbose=True`` — the full parameter list.
+
+    Parameters
+    ----------
+    verbose : bool
+        If True, print the full docstring for every function (default False).
+
+    Example
+    -------
+    >>> list_helpers()            # compact view
+    >>> list_helpers(verbose=True)  # full docstrings
+    """
+    import inspect, textwrap
+
+    # Registry: module → list of (function_name, function_object, one-liner)
+    _REGISTRY = [
+        # Module 1 — Preprocessing
+        ("Module 1 — Preprocessing", [
+            load_bold_and_mask,
+            load_confounds,
+            compute_fd,
+            clean_bold_run,
+            plot_motion_qc,
+            ants_to_nibabel,
+            warp_group_mask_to_func,
+            filter_mask_by_variance,
+        ]),
+        # Module 2 — Beta Estimation
+        ("Module 2 — Beta Estimation", [
+            make_lsa_events,
+            make_lss_events,
+            fit_lsa_run,
+            fit_lss_run,
+            save_beta_manifest,
+        ]),
+        # Module 3 — MVPA Decoding
+        ("Module 3 — MVPA Decoding", [
+            load_beta_matrix,
+            run_svm_decoding,
+            compute_importance_map,
+            plot_confusion_matrix,
+        ]),
+        # Module 4 — Searchlight
+        ("Module 4 — Searchlight", [
+            run_searchlight,
+            summarise_searchlight,
+        ]),
+        # Module 5 — Tutorial helpers
+        ("Module 5 — Tutorial (beta → MVPA combined)", [
+            stack_betas_from_dict,
+            run_permutation_test,
+            make_block_events,
+        ]),
+        # Utilities
+        ("Utility", [
+            track_runtime,
+            get_bold_paths,
+            print_section,
+            list_helpers,
+        ]),
+    ]
+
+    W = 72
+    print()
+    print("█" * W)
+    print(f"{'fmri_helpers — Available Functions':^{W}}")
+    print("█" * W)
+
+    for module_name, funcs in _REGISTRY:
+        print()
+        print(f"  ┌─ {module_name} {'─'*(W - len(module_name) - 6)}")
+        for fn in funcs:
+            try:
+                sig     = str(inspect.signature(fn))
+                # Trim long signatures
+                if len(sig) > 55:
+                    sig = sig[:52] + "..."
+                doc     = (fn.__doc__ or "").strip()
+                one_line = doc.split("\n")[0] if doc else "(no docstring)"
+                print(f"  │  {fn.__name__}{sig}")
+                print(f"  │      → {one_line}")
+                if verbose and doc:
+                    wrapped = textwrap.indent(
+                        textwrap.fill(doc, width=60), prefix="  │      ")
+                    print(wrapped)
+                print("  │")
+            except (TypeError, ValueError):
+                print(f"  │  {fn.__name__}  (signature unavailable)")
+                print("  │")
+
+    print("  └" + "─" * (W - 2))
+    print()
+    print("  Usage examples:")
+    print("    list_helpers()              # this compact view")
+    print("    list_helpers(verbose=True)  # full docstrings")
+    print("    help(fit_lsa_run)           # single function deep-dive")
+    print()
