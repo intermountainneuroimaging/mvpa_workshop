@@ -955,11 +955,11 @@ def compute_importance_map(pipe: Pipeline,
                            n_mask_voxels: int
                            ) -> nib.Nifti1Image:
     """Extract mean |SVM weight| importance map and convert to NIfTI.
-
+ 
     Handles the two-layer index expansion needed when ANOVA feature selection
     reduces the feature space before classification:
       n_selected → n_active_voxels → n_mask_voxels
-
+ 
     Parameters
     ----------
     pipe : Pipeline
@@ -972,33 +972,49 @@ def compute_importance_map(pipe: Pipeline,
         Boolean array, shape (n_mask_voxels,). True where X columns come from.
     n_mask_voxels : int
         Total voxels in the mask.
-
+ 
     Returns
     -------
     importance_img : nib.Nifti1Image
         3-D NIfTI of mean absolute SVM weights, in mask voxel space.
-
+ 
     Example
     -------
     >>> imp_img = compute_importance_map(pipe, X, masker, active_voxels, n_mask)
     >>> imp_img.to_filename("importance_map.nii.gz")
     """
-    svm_step = pipe.named_steps['svm']
-    fs_step  = pipe.named_steps['fs']
-    coef     = svm_step.coef_                         # (n_hyperplanes, n_selected)
-    imp_sel  = np.mean(np.abs(coef), axis=0)          # (n_selected,)
-
+    # Detect SVM step: first step that has coef_ after fitting
+    svm_step = next(
+        (s for s in pipe.named_steps.values() if hasattr(s, 'coef_')),
+        None,
+    )
+    if svm_step is None:
+        raise ValueError(
+            "compute_importance_map: no fitted step with coef_ found in pipeline. "
+            f"Steps: {list(pipe.named_steps.keys())}"
+        )
+ 
+    # Detect feature-selection step: first step that has get_support()
+    fs_step = next(
+        (s for s in pipe.named_steps.values()
+         if s != 'passthrough' and hasattr(s, 'get_support')),
+        None,
+    )
+ 
+    coef    = svm_step.coef_                          # (n_hyperplanes, n_selected)
+    imp_sel = np.mean(np.abs(coef), axis=0)           # (n_selected,)
+ 
     # Layer 1: n_selected → n_active_voxels
     imp_active = np.zeros(X.shape[1])
-    if fs_step != 'passthrough' and hasattr(fs_step, 'get_support'):
+    if fs_step is not None:
         imp_active[fs_step.get_support()] = imp_sel
     else:
         imp_active = imp_sel
-
+ 
     # Layer 2: n_active_voxels → n_mask_voxels
     imp_full = np.zeros(n_mask_voxels)
     imp_full[active_voxels] = imp_active
-
+ 
     return masker.inverse_transform(imp_full)
 
 
@@ -1567,3 +1583,244 @@ def list_helpers(verbose: bool = False) -> None:
     print("    list_helpers(verbose=True)  # full docstrings")
     print("    help(fit_lsa_run)           # single function deep-dive")
     print()
+
+    
+    
+
+import pandas as pd
+import numpy as np
+from typing import Optional
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core grouping function
+# ─────────────────────────────────────────────────────────────────────────────
+
+def events_to_blocks(
+    events: pd.DataFrame,
+    gap_threshold: float = 2.0,
+    condition_col: str = "trial_type",
+    onset_col: str = "onset",
+    duration_col: str = "duration",
+    keep_cols: Optional[list] = None,
+    strategy: str = "gap",
+) -> pd.DataFrame:
+    """
+    Merge individual BIDS event trials into block-level regressors.
+
+    Parameters
+    ----------
+    events : pd.DataFrame
+        BIDS events table with at least `onset`, `duration`, and
+        `trial_type` columns.
+    gap_threshold : float
+        Maximum inter-trial gap (seconds) allowed within a block.
+        Trials of the same type whose ITI <= this value are merged.
+        Ignored when strategy="adjacent".
+    condition_col : str
+        Column name that identifies the condition / trial type.
+    onset_col : str
+        Column name for trial onset (seconds).
+    duration_col : str
+        Column name for trial duration (seconds).
+    keep_cols : list of str, optional
+        Additional columns to carry forward.  When trials within a
+        block have identical values the value is preserved; if they
+        differ, the block cell contains a pipe-separated list of
+        unique values.
+    strategy : {"gap", "adjacent"}
+        Grouping strategy (see module docstring).
+
+    Returns
+    -------
+    pd.DataFrame
+        BIDS-compatible blocks table: onset, duration, trial_type
+        (+ any keep_cols).  Sorted by onset.
+    """
+    if events.empty:
+        return events.copy()
+
+    required = {onset_col, duration_col, condition_col}
+    missing  = required - set(events.columns)
+    if missing:
+        raise ValueError(f"events DataFrame is missing columns: {missing}")
+
+    if strategy not in ("gap", "adjacent"):
+        raise ValueError(f"strategy must be 'gap' or 'adjacent', got {strategy!r}")
+
+    df = (
+        events
+        .copy()
+        .sort_values(onset_col)
+        .reset_index(drop=True)
+    )
+
+    extra_cols = keep_cols or []
+
+    blocks = []
+
+    # ── Group trials into blocks ──────────────────────────────────────────────
+    # Walk through rows; start a new block whenever the condition changes
+    # OR the gap to the previous trial exceeds gap_threshold.
+
+    block_start_idx = 0
+
+    for i in range(1, len(df) + 1):
+        # Sentinel: treat end of file as always starting a new block
+        new_block = (i == len(df))
+
+        if not new_block:
+            same_cond = (
+                df.loc[i, condition_col] == df.loc[i - 1, condition_col]
+            )
+            prev_end  = (
+                df.loc[i - 1, onset_col] + df.loc[i - 1, duration_col]
+            )
+            gap       = df.loc[i, onset_col] - prev_end
+
+            if strategy == "gap":
+                new_block = not same_cond or gap > gap_threshold
+            else:  # adjacent
+                new_block = not same_cond or gap > 0
+
+        if new_block:
+            chunk = df.iloc[block_start_idx:i]
+            block = _summarise_block(
+                chunk, onset_col, duration_col, condition_col, extra_cols
+            )
+            blocks.append(block)
+            block_start_idx = i
+
+    result = pd.DataFrame(blocks)
+
+    # Enforce BIDS column order; n_trials always appended after extra_cols
+    base_cols = [onset_col, duration_col, condition_col]
+    col_order = base_cols + [c for c in extra_cols if c in result.columns] + ["n_trials"]
+    result = result[col_order].sort_values(onset_col).reset_index(drop=True)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper — summarise one block
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _summarise_block(
+    chunk: pd.DataFrame,
+    onset_col: str,
+    duration_col: str,
+    condition_col: str,
+    extra_cols: list,
+) -> dict:
+    """Collapse a group of same-condition trials into a single block row."""
+    first = chunk.iloc[0]
+    last  = chunk.iloc[-1]
+
+    onset    = first[onset_col]
+    end_time = last[onset_col] + last[duration_col]
+    duration = end_time - onset
+
+    row = {
+        onset_col:     onset,
+        duration_col:  round(duration, 4),
+        condition_col: first[condition_col],
+        "n_trials":    len(chunk),
+    }
+
+    for col in extra_cols:
+        if col not in chunk.columns:
+            continue
+        unique_vals = chunk[col].dropna().unique()
+        row[col] = unique_vals[0] if len(unique_vals) == 1 else "|".join(
+            str(v) for v in unique_vals
+        )
+
+    return row
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience: load TSV → blocks in one call
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tsv_to_blocks(
+    tsv_path: str,
+    gap_threshold: float = 2.0,
+    **kwargs,
+) -> pd.DataFrame:
+    """
+    Load a BIDS events TSV and return block-level regressors.
+
+    Parameters
+    ----------
+    tsv_path : str
+        Path to the *_events.tsv file.
+    gap_threshold : float
+        Maximum within-block gap (seconds).
+    **kwargs
+        Passed to events_to_blocks().
+
+    Returns
+    -------
+    pd.DataFrame
+        Block-level events table.
+    """
+    events = pd.read_csv(tsv_path, sep="\t")
+    return events_to_blocks(events, gap_threshold=gap_threshold, **kwargs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience: build a nilearn-compatible design matrix from blocks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def blocks_to_design_matrix(
+    blocks: pd.DataFrame,
+    frame_times: np.ndarray,
+    hrf_model: str = "spm",
+    drift_model: str = "cosine",
+    high_pass: float = 1 / 128,
+    condition_col: str = "trial_type",
+    onset_col: str = "onset",
+    duration_col: str = "duration",
+):
+    """
+    Build a first-level design matrix from block-level regressors.
+
+    Requires nilearn >= 0.10.
+
+    Parameters
+    ----------
+    blocks : pd.DataFrame
+        Output of events_to_blocks().
+    frame_times : np.ndarray
+        TR onset times in seconds: np.arange(n_scans) * TR
+    hrf_model : str
+        HRF model passed to nilearn (e.g. "spm", "glover").
+    drift_model : str
+        Drift model ("cosine", "polynomial", None).
+    high_pass : float
+        High-pass cutoff in Hz (default 1/128 s = 0.0078 Hz).
+    condition_col, onset_col, duration_col : str
+        Column names.
+
+    Returns
+    -------
+    pd.DataFrame
+        Design matrix (time × regressors).
+    """
+    from nilearn.glm.first_level import make_first_level_design_matrix
+
+    # nilearn expects columns: onset, duration, trial_type
+    events_nl = blocks.rename(columns={
+        onset_col:     "onset",
+        duration_col:  "duration",
+        condition_col: "trial_type",
+    })[["onset", "duration", "trial_type"]]
+
+    dm = make_first_level_design_matrix(
+        frame_times=frame_times,
+        events=events_nl,
+        hrf_model=hrf_model,
+        drift_model=drift_model,
+        high_pass=high_pass,
+    )
+    return dm
